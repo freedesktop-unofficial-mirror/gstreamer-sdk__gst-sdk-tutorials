@@ -1,8 +1,10 @@
-package com.gst_sdk_tutorials.tutorial_2;
+package com.gst_sdk_tutorials.tutorial_3;
 
 import android.app.Activity;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.View.OnClickListener;
 import android.widget.ImageButton;
@@ -11,12 +13,14 @@ import android.widget.Toast;
 
 import com.gstreamer.GStreamer;
 
-public class Tutorial2 extends Activity {
+public class Tutorial3 extends Activity implements SurfaceHolder.Callback {
     private native void nativeInit();     // Initialize native code, build pipeline, etc
     private native void nativeFinalize(); // Destroy pipeline and shutdown native code
     private native void nativePlay();     // Set pipeline to PLAYING
     private native void nativePause();    // Set pipeline to PAUSED
     private static native boolean nativeClassInit(); // Initialize native class: cache Method IDs for callbacks
+    private native void nativeSurfaceInit(Object surface);
+    private native void nativeSurfaceFinalize();
     private long native_custom_data;      // Native code will use this to keep private data
 
     private boolean is_playing_desired;   // Whether the user asked to go to PLAYING
@@ -53,6 +57,10 @@ public class Tutorial2 extends Activity {
                 nativePause();
             }
         });
+
+        SurfaceView sv = (SurfaceView) this.findViewById(R.id.surface_video);
+        SurfaceHolder sh = sv.getHolder();
+        sh.addCallback(this);
 
         if (savedInstanceState != null) {
             is_playing_desired = savedInstanceState.getBoolean("playing");
@@ -112,8 +120,24 @@ public class Tutorial2 extends Activity {
 
     static {
         System.loadLibrary("gstreamer_android");
-        System.loadLibrary("tutorial-2");
+        System.loadLibrary("tutorial-3");
         nativeClassInit();
+    }
+
+    public void surfaceChanged(SurfaceHolder holder, int format, int width,
+            int height) {
+        Log.d("GStreamer", "Surface changed to format " + format + " width "
+                + width + " height " + height);
+        nativeSurfaceInit (holder.getSurface());
+    }
+
+    public void surfaceCreated(SurfaceHolder holder) {
+        Log.d("GStreamer", "Surface created: " + holder.getSurface());
+    }
+
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        Log.d("GStreamer", "Surface destroyed");
+        nativeSurfaceFinalize ();
     }
 
 }

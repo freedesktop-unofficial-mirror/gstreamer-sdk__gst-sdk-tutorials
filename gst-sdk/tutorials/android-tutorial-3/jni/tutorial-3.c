@@ -1,7 +1,11 @@
 #include <string.h>
 #include <jni.h>
 #include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include <gst/gst.h>
+#include <gst/interfaces/xoverlay.h>
+#include <gst/video/video.h>
 #include <pthread.h>
 
 GST_DEBUG_CATEGORY_STATIC (debug_category);
@@ -21,11 +25,13 @@ GST_DEBUG_CATEGORY_STATIC (debug_category);
 
 /* Structure to contain all our information, so we can pass it to callbacks */
 typedef struct _CustomData {
-  jobject app;           /* Application instance, used to call its methods. A global reference is kept. */
-  GstElement *pipeline;  /* The running pipeline */
-  GMainContext *context; /* GLib context used to run the main loop */
-  GMainLoop *main_loop;  /* GLib main loop */
-  gboolean initialized;  /* To avoid informing the UI multiple times about the initialization */
+  jobject app;            /* Application instance, used to call its methods. A global reference is kept. */
+  GstElement *pipeline;   /* The running pipeline */
+  GMainContext *context;  /* GLib context used to run the main loop */
+  GMainLoop *main_loop;   /* GLib main loop */
+  gboolean initialized;   /* To avoid informing the UI multiple times about the initialization */
+  GstElement *video_sink; /* The video sink element which receives XOverlay commands */
+  ANativeWindow *native_window; /* The Android native window where video will be rendered */
 } CustomData;
 
 /* These global variables cache values which are not changing during execution */
@@ -120,8 +126,12 @@ static void state_changed_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
  * These conditions will change depending on the application */
 static void check_initialization_complete (CustomData *data) {
   JNIEnv *env = get_jni_env ();
-  if (!data->initialized && data->main_loop) {
-    GST_DEBUG ("Initialization complete, notifying application. main_loop:%p", data->main_loop);
+  if (!data->initialized && data->native_window && data->main_loop) {
+    GST_DEBUG ("Initialization complete, notifying application. native_window:%p main_loop:%p", data->native_window, data->main_loop);
+
+    /* The main loop is running and we received a native window, inform the sink about it */
+    gst_x_overlay_set_window_handle (GST_X_OVERLAY (data->video_sink), (guintptr)data->native_window);
+
     (*env)->CallVoidMethod (env, data->app, on_gstreamer_initialized_method_id);
     if ((*env)->ExceptionCheck (env)) {
       GST_ERROR ("Failed to call Java method");
@@ -146,12 +156,21 @@ static void *app_function (void *userdata) {
   g_main_context_push_thread_default(data->context);
 
   /* Build pipeline */
-  data->pipeline = gst_parse_launch("audiotestsrc ! audioconvert ! audioresample ! autoaudiosink", &error);
+  data->pipeline = gst_parse_launch("videotestsrc ! warptv ! ffmpegcolorspace ! autovideosink", &error);
   if (error) {
     gchar *message = g_strdup_printf("Unable to build pipeline: %s", error->message);
     g_clear_error (&error);
     set_ui_message(message, data);
     g_free (message);
+    return NULL;
+  }
+
+  /* Set the pipeline to READY, so it can already accept a window handle, if we have one */
+  gst_element_set_state(data->pipeline, GST_STATE_READY);
+
+  data->video_sink = gst_bin_get_by_interface(GST_BIN(data->pipeline), GST_TYPE_X_OVERLAY);
+  if (!data->video_sink) {
+    GST_ERROR ("Could not retrieve video sink");
     return NULL;
   }
 
@@ -178,6 +197,7 @@ static void *app_function (void *userdata) {
   g_main_context_pop_thread_default(data->context);
   g_main_context_unref (data->context);
   gst_element_set_state (data->pipeline, GST_STATE_NULL);
+  gst_object_unref (data->video_sink);
   gst_object_unref (data->pipeline);
 
   return NULL;
@@ -191,8 +211,8 @@ static void *app_function (void *userdata) {
 static void gst_native_init (JNIEnv* env, jobject thiz) {
   CustomData *data = g_new0 (CustomData, 1);
   SET_CUSTOM_DATA (env, thiz, custom_data_field_id, data);
-  GST_DEBUG_CATEGORY_INIT (debug_category, "tutorial-2", 0, "Android tutorial 2");
-  gst_debug_set_threshold_for_name("tutorial-2", GST_LEVEL_DEBUG);
+  GST_DEBUG_CATEGORY_INIT (debug_category, "tutorial-3", 0, "Android tutorial 3");
+  gst_debug_set_threshold_for_name("tutorial-3", GST_LEVEL_DEBUG);
   GST_DEBUG ("Created CustomData at %p", data);
   data->app = (*env)->NewGlobalRef (env, thiz);
   GST_DEBUG ("Created GlobalRef for app object at %p", data->app);
@@ -241,10 +261,50 @@ static jboolean gst_native_class_init (JNIEnv* env, jclass klass) {
     /* We emit this message through the Android log instead of the GStreamer log because the later
      * has not been initialized yet.
      */
-    __android_log_print (ANDROID_LOG_ERROR, "tutorial-2", "The calling class does not implement all necessary interface methods");
+    __android_log_print (ANDROID_LOG_ERROR, "tutorial-3", "The calling class does not implement all necessary interface methods");
     return JNI_FALSE;
   }
   return JNI_TRUE;
+}
+
+static void gst_native_surface_init (JNIEnv *env, jobject thiz, jobject surface) {
+  CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
+  if (!data) return;
+  ANativeWindow *new_native_window = ANativeWindow_fromSurface(env, surface);
+  GST_DEBUG ("Received surface %p (native window %p)", surface, new_native_window);
+
+  if (data->native_window) {
+    ANativeWindow_release (data->native_window);
+    if (data->native_window == new_native_window) {
+      GST_DEBUG ("New native window is the same as the previous one", data->native_window);
+      if (data->video_sink) {
+        gst_x_overlay_expose(GST_X_OVERLAY (data->video_sink));
+        gst_x_overlay_expose(GST_X_OVERLAY (data->video_sink));
+      }
+      return;
+    } else {
+      GST_DEBUG ("Released previous native window %p", data->native_window);
+      data->initialized = FALSE;
+    }
+  }
+  data->native_window = new_native_window;
+
+  check_initialization_complete (data);
+}
+
+static void gst_native_surface_finalize (JNIEnv *env, jobject thiz) {
+  CustomData *data = GET_CUSTOM_DATA (env, thiz, custom_data_field_id);
+  if (!data) return;
+  GST_DEBUG ("Releasing Native Window %p", data->native_window);
+
+  if (data->video_sink) {
+    gst_x_overlay_set_window_handle (GST_X_OVERLAY (data->video_sink), (guintptr)NULL);
+    gst_element_set_state (data->pipeline, GST_STATE_READY);
+  }
+
+  ANativeWindow_release (data->native_window);
+  data->native_window = NULL;
+  data->initialized = FALSE;
 }
 
 /* List of implemented native methods */
@@ -253,6 +313,8 @@ static JNINativeMethod native_methods[] = {
   { "nativeFinalize", "()V", (void *) gst_native_finalize},
   { "nativePlay", "()V", (void *) gst_native_play},
   { "nativePause", "()V", (void *) gst_native_pause},
+  { "nativeSurfaceInit", "(Ljava/lang/Object;)V", (void *) gst_native_surface_init},
+  { "nativeSurfaceFinalize", "()V", (void *) gst_native_surface_finalize},
   { "nativeClassInit", "()Z", (void *) gst_native_class_init}
 };
 
@@ -263,10 +325,10 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
   java_vm = vm;
 
   if ((*vm)->GetEnv(vm, (void**) &env, JNI_VERSION_1_4) != JNI_OK) {
-    __android_log_print (ANDROID_LOG_ERROR, "tutorial-2", "Could not retrieve JNIEnv");
+    __android_log_print (ANDROID_LOG_ERROR, "tutorial-3", "Could not retrieve JNIEnv");
     return 0;
   }
-  jclass klass = (*env)->FindClass (env, "com/gst_sdk_tutorials/tutorial_2/Tutorial2");
+  jclass klass = (*env)->FindClass (env, "com/gst_sdk_tutorials/tutorial_3/Tutorial3");
   (*env)->RegisterNatives (env, klass, native_methods, G_N_ELEMENTS(native_methods));
 
   pthread_key_create (&current_jni_env, detach_current_thread);
